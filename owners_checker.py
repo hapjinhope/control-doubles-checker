@@ -165,6 +165,7 @@ class OwnersRepository:
         response = self.session.patch(
             self.rest_url,
             headers=headers,
+            params={"id": "not.is.null"},
             json=payload,
             timeout=60,
         )
