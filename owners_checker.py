@@ -62,8 +62,10 @@ class CheckConfig:
     owners_table: str
     check_column: str
     reset_hour: int
+    owners_link_column: str
     objects_table: str
     objects_price_column: str
+    objects_link_column: str
     parser_url: str
     window_start_hour: int
     window_end_hour: int
@@ -95,14 +97,19 @@ def load_config() -> CheckConfig:
     if window_end <= window_start or window_end > 24:
         raise RuntimeError("CHECK_WINDOW_END_HOUR must be within 1-24 and greater than start")
 
+    owners_link_column = os.getenv("OWNERS_LINK_COLUMN") or "external_id"
+    objects_link_column = os.getenv("OBJECTS_LINK_COLUMN") or owners_link_column
+
     return CheckConfig(
         supabase_url=supabase_url,
         supabase_key=supabase_key,
         owners_table=os.getenv("OWNERS_TABLE", "owners"),
         check_column=os.getenv("OWNERS_CHECK_COLUMN", "checked"),
         reset_hour=_env_int("OWNERS_CHECK_RESET_HOUR", 0),
+        owners_link_column=owners_link_column,
         objects_table=os.getenv("OBJECTS_TABLE", "objects"),
         objects_price_column=os.getenv("OBJECTS_PRICE_COLUMN", "price"),
+        objects_link_column=objects_link_column,
         parser_url=parser_url,
         window_start_hour=window_start,
         window_end_hour=window_end,
@@ -129,7 +136,7 @@ class OwnersRepository:
 
     def fetch_unchecked(self, limit: int) -> List[Dict[str, Any]]:
         params = {
-            "select": f"id,external_id,url,parsed,status,updated_at,{self.config.check_column}",
+            "select": self._select_fields(),
             "order": "updated_at.asc.nullsfirst",
             "limit": limit,
             "or": f"({self.config.check_column}.is.false,{self.config.check_column}.is.null)",
@@ -140,7 +147,11 @@ class OwnersRepository:
             params=params,
             timeout=30,
         )
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except HTTPError as exc:
+            LOG.error("Failed to fetch owners batch: %s - %s", exc, response.text)
+            raise
         data = response.json()
         return data if isinstance(data, list) else []
 
@@ -183,22 +194,30 @@ class OwnersRepository:
         if response.status_code not in (200, 204):
             response.raise_for_status()
 
+    def _select_fields(self) -> str:
+        fields = ["id", "url", "parsed", "status", "updated_at", self.config.check_column]
+        link_col = self.config.owners_link_column
+        if link_col and link_col not in fields:
+            fields.append(link_col)
+        return ",".join(fields)
+
 
 class ObjectsRepository:
     def __init__(self, config: CheckConfig):
         self.config = config
         self.session = requests.Session()
         self.rest_url = config.supabase_url.rstrip("/") + f"/rest/v1/{config.objects_table}"
+        self.link_column = config.objects_link_column or "id"
 
-    def _make_params(self, external_id: Any) -> Dict[str, Any]:
+    def _make_params(self, link_value: Any) -> Dict[str, Any]:
         return {
-            "select": f"id,{self.config.objects_price_column},external_id",
-            "external_id": f"eq.{external_id}",
+            "select": f"id,{self.config.objects_price_column},{self.link_column}",
+            self.link_column: f"eq.{link_value}",
             "limit": 1,
         }
 
-    def fetch_by_external_id(self, external_id: Any) -> Optional[Dict[str, Any]]:
-        params = self._make_params(external_id)
+    def fetch_by_link(self, link_value: Any) -> Optional[Dict[str, Any]]:
+        params = self._make_params(link_value)
         response = self.session.get(
             self.rest_url,
             headers=build_headers(self.config.supabase_key),
@@ -211,26 +230,26 @@ class ObjectsRepository:
             return data[0]
         return None
 
-    def update_price(self, external_id: Any, new_price: Any) -> None:
+    def update_price(self, link_value: Any, new_price: Any) -> None:
         headers = build_headers(self.config.supabase_key)
         headers["Prefer"] = "return=minimal"
         payload = {self.config.objects_price_column: new_price}
         response = self.session.patch(
             self.rest_url,
             headers=headers,
-            params={"external_id": f"eq.{external_id}"},
+            params={self.link_column: f"eq.{link_value}"},
             json=payload,
             timeout=30,
         )
         if response.status_code not in (200, 204):
             response.raise_for_status()
 
-    def delete_object(self, external_id: Any) -> None:
+    def delete_object(self, link_value: Any) -> None:
         headers = build_headers(self.config.supabase_key)
         response = self.session.delete(
             self.rest_url,
             headers=headers,
-            params={"external_id": f"eq.{external_id}"},
+            params={self.link_column: f"eq.{link_value}"},
             timeout=30,
         )
         if response.status_code not in (200, 204):
@@ -359,7 +378,7 @@ class OwnersCheckService:
 
     def _process_owner(self, owner: Dict[str, Any]) -> bool:
         owner_id = owner.get("id")
-        external_id = owner.get("external_id")
+        link_value = self._owner_link(owner)
         url = (owner.get("url") or "").strip()
         if not owner_id:
             return False
@@ -380,11 +399,13 @@ class OwnersCheckService:
             return False
 
         status_flag = self._extract_status(parser_result)
+        inactive_reason = None
         if status_flag is False:
-            self._delete_everywhere(owner_id, external_id)
+            inactive_reason = self._build_inactive_reason(parser_result)
+            self._delete_everywhere(owner_id, link_value, parser_result, inactive_reason)
             return True
 
-        self._handle_price(owner_id, external_id, parser_result)
+        self._handle_price(owner_id, link_value, parser_result)
         payload = {
             self.config.check_column: True,
             "parsed": self._stringify_result(parser_result),
@@ -392,6 +413,8 @@ class OwnersCheckService:
         }
         if status_flag is not None:
             payload["status"] = status_flag
+        else:
+            payload["status"] = True
         self.owners_repo.update_owner(owner_id, payload)
         return True
 
@@ -433,30 +456,53 @@ class OwnersCheckService:
             return "cian"
         return "unknown"
 
-    def _delete_everywhere(self, owner_id: int, external_id: Optional[Any]) -> None:
-        row = self.objects_repo.fetch_by_external_id(external_id) if external_id else None
-        label = self._format_object_label(owner_id, external_id)
-        LOG.info("Object %s признан неактуальным, удаляем из owners/objects", label)
-        self._register_event(f"❌ {label} — объявление удалено на площадке")
+    def _delete_everywhere(
+        self,
+        owner_id: int,
+        link_value: Optional[Any],
+        parser_result: Optional[Any] = None,
+        reason: Optional[str] = None,
+    ) -> None:
+        row = self.objects_repo.fetch_by_link(link_value) if link_value else None
+        external_value = row.get(self.objects_repo.link_column) if row else link_value
+        label = self._format_external_label(external_value)
+        summary_line = "❌ " + label + " — объявление больше не актуально"
+        LOG.info(summary_line)
+        self._register_event(summary_line)
         try:
             self.owners_repo.delete_owner(owner_id)
             LOG.info("Owner %s удалён", label)
         except Exception:
             LOG.exception("Failed to delete owner %s", label)
-        if not external_id:
-            LOG.warning("External_id отсутствует для %s, пропускаем удаление в objects", label)
-            return
-        try:
-            self.objects_repo.delete_object(external_id)
-            LOG.info("Object %s удалён из %s по external_id", label, self.config.objects_table)
-        except Exception:
-            LOG.exception("Failed to delete object %s by external_id %s", label, external_id)
+        if external_value in (None, ""):
+            LOG.warning(
+                "%s отсутствует для %s, пропускаем удаление в objects",
+                self.objects_repo.link_column,
+                label,
+            )
+        else:
+            try:
+                self.objects_repo.delete_object(external_value)
+                LOG.info(
+                    "Object %s удалён из %s по %s=%s",
+                    label,
+                    self.config.objects_table,
+                    self.objects_repo.link_column,
+                    external_value,
+                )
+            except Exception:
+                LOG.exception(
+                    "Failed to delete object %s by %s %s",
+                    label,
+                    self.objects_repo.link_column,
+                    external_value,
+                )
 
-    def _handle_price(self, owner_id: int, external_id: Optional[Any], parser_result: Any) -> None:
+    def _handle_price(self, owner_id: int, link_value: Optional[Any], parser_result: Any) -> None:
         if not isinstance(parser_result, dict):
             return
-        if not external_id:
-            LOG.debug("Owner #%s не содержит external_id — пропуск обновления цены", owner_id)
+        if not link_value:
+            LOG.debug("Owner #%s не содержит %s — пропуск обновления цены", owner_id, self.config.owners_link_column)
             return
         raw_price = self._extract_price(parser_result)
         if raw_price is None:
@@ -464,16 +510,21 @@ class OwnersCheckService:
         new_price = self._normalize_price(raw_price)
         if new_price is None:
             return
-        row = self.objects_repo.fetch_by_external_id(external_id)
+        row = self.objects_repo.fetch_by_link(link_value)
         if not row:
-            LOG.debug("Object with external_id %s not found in %s", external_id, self.config.objects_table)
+            LOG.debug(
+                "Object with %s=%s not found in %s",
+                self.objects_repo.link_column,
+                link_value,
+                self.config.objects_table,
+            )
             return
-        label = self._format_object_label(owner_id, external_id)
+        label = self._format_object_label(owner_id, link_value)
         current_raw = row.get(self.config.objects_price_column)
         current_price = self._normalize_price(current_raw)
         if current_price is None or new_price < current_price:
             try:
-                self.objects_repo.update_price(external_id, new_price)
+                self.objects_repo.update_price(link_value, new_price)
                 if current_price is None:
                     LOG.info("Initialized price for %s -> %s", label, new_price)
                 else:
@@ -497,6 +548,12 @@ class OwnersCheckService:
             value = data.get(key)
             if isinstance(value, bool):
                 return value
+            if isinstance(value, str):
+                lowered = value.strip().lower()
+                if lowered in {"unpublished", "inactive", "deleted", "closed", "removed", "not_active"}:
+                    return False
+                if lowered in {"active", "published", "available", "actual"}:
+                    return True
         return None
 
     @staticmethod
@@ -537,11 +594,48 @@ class OwnersCheckService:
         payload.update(extra)
         self.owners_repo.update_owner(owner_id, payload)
 
+    def _owner_link(self, owner: Dict[str, Any]) -> Optional[Any]:
+        column = self.config.owners_link_column
+        if not column:
+            return owner.get("id")
+        value = owner.get(column)
+        if value in ("", None) and column != "id":
+            return owner.get("id")
+        return value
+
+    def _format_external_label(self, link_value: Optional[Any]) -> str:
+        column = self.objects_repo.link_column
+        if link_value in (None, ""):
+            return f"{column}=unknown"
+        return f"{column} {link_value}"
+
     @staticmethod
-    def _format_object_label(owner_id: int, external_id: Optional[Any]) -> str:
-        if external_id not in (None, ""):
-            return f"owner #{owner_id} / external_id {external_id}"
-        return f"owner #{owner_id}"
+    def _format_snippet(value: Any) -> str:
+        if value is None:
+            return "None"
+        if isinstance(value, (str, int, float, bool)):
+            return str(value)[:200]
+        try:
+            return json.dumps(value, ensure_ascii=False)[:200]
+        except (TypeError, ValueError):
+            return str(value)[:200]
+
+    @staticmethod
+    def _build_inactive_reason(parser_result: Any) -> Optional[str]:
+        if isinstance(parser_result, dict):
+            parts: List[str] = []
+            status_val = parser_result.get("status")
+            message = parser_result.get("message")
+            source = parser_result.get("source")
+            if status_val:
+                parts.append(f"parser status={status_val}")
+            if message:
+                parts.append(message)
+            if source:
+                parts.append(f"source={source}")
+            if parts:
+                return "; ".join(parts)
+        return None
 
     @staticmethod
     def _fmt_price(value: float) -> str:
