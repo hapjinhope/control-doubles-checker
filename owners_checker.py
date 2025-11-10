@@ -5,6 +5,7 @@ import os
 import random
 import re
 import time
+import threading
 from dataclasses import dataclass
 from datetime import date, datetime, time as dt_time, timedelta, timezone
 from typing import Any, Dict, List, Optional
@@ -78,6 +79,10 @@ class CheckConfig:
     telegram_proxy_url: Optional[str]
     log_level: str
     summary_report_hour: int
+    cian_api_base: str
+    cian_api_token: Optional[str]
+    cian_poll_interval: int
+    cian_report_page_size: int
 
 
 def load_config() -> CheckConfig:
@@ -97,7 +102,7 @@ def load_config() -> CheckConfig:
     if window_end <= window_start or window_end > 24:
         raise RuntimeError("CHECK_WINDOW_END_HOUR must be within 1-24 and greater than start")
 
-    owners_link_column = os.getenv("OWNERS_LINK_COLUMN") or "external_id"
+    owners_link_column = os.getenv("OWNERS_LINK_COLUMN") or "id"
     objects_link_column = os.getenv("OBJECTS_LINK_COLUMN") or owners_link_column
 
     return CheckConfig(
@@ -122,6 +127,10 @@ def load_config() -> CheckConfig:
         telegram_proxy_url=os.getenv("TELEGRAM_PROXY_URL") or None,
         log_level=os.getenv("OWNERS_CHECK_LOGLEVEL", "INFO").upper(),
         summary_report_hour=_env_int("SUMMARY_REPORT_HOUR", 10),
+        cian_api_base=os.getenv("CIAN_API_BASE", "https://public-api.cian.ru"),
+        cian_api_token=os.getenv("CIAN_API_TOKEN") or None,
+        cian_poll_interval=_env_int("CIAN_POLL_INTERVAL_SECONDS", 300),
+        cian_report_page_size=_env_int("CIAN_REPORT_PAGE_SIZE", 100),
     )
 
 
@@ -210,8 +219,11 @@ class ObjectsRepository:
         self.link_column = config.objects_link_column or "id"
 
     def _make_params(self, link_value: Any) -> Dict[str, Any]:
+        columns = [self.config.objects_price_column]
+        if self.link_column not in columns:
+            columns.append(self.link_column)
         return {
-            "select": f"id,{self.config.objects_price_column},{self.link_column}",
+            "select": ",".join(columns),
             self.link_column: f"eq.{link_value}",
             "limit": 1,
         }
@@ -224,7 +236,13 @@ class ObjectsRepository:
             params=params,
             timeout=30,
         )
-        response.raise_for_status()
+        if response.status_code not in (200, 206):
+            LOG.error(
+                "Objects fetch failed [%s]: %s",
+                response.status_code,
+                response.text,
+            )
+            response.raise_for_status()
         data = response.json()
         if isinstance(data, list) and data:
             return data[0]
@@ -242,6 +260,11 @@ class ObjectsRepository:
             timeout=30,
         )
         if response.status_code not in (200, 204):
+            LOG.error(
+                "Objects price update failed [%s]: %s",
+                response.status_code,
+                response.text,
+            )
             response.raise_for_status()
 
     def delete_object(self, link_value: Any) -> None:
@@ -253,9 +276,130 @@ class ObjectsRepository:
             timeout=30,
         )
         if response.status_code not in (200, 204):
+            LOG.error(
+                "Objects delete failed [%s]: %s",
+                response.status_code,
+                response.text,
+            )
+            response.raise_for_status()
+
+    def update_status(self, link_value: Any, status_value: Any) -> None:
+        headers = build_headers(self.config.supabase_key)
+        headers["Prefer"] = "return=minimal"
+        payload = {"status": status_value}
+        response = self.session.patch(
+            self.rest_url,
+            headers=headers,
+            params={self.link_column: f"eq.{link_value}"},
+            json=payload,
+            timeout=30,
+        )
+        if response.status_code not in (200, 204):
             response.raise_for_status()
 
 
+class CianClient:
+    def __init__(self, config: CheckConfig):
+        if not config.cian_api_token:
+            raise RuntimeError("CIAN_API_TOKEN is required")
+        self.base_url = config.cian_api_base.rstrip("/")
+        self.token = config.cian_api_token
+        self.page_size = config.cian_report_page_size
+        self.session = requests.Session()
+
+    def _headers(self) -> Dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self.token}",
+            "Accept": "application/json",
+        }
+
+    def get_last_order_info(self) -> Dict[str, Any]:
+        return self._get("/v1/get-last-order-info")
+
+    def get_order(self) -> Dict[str, Any]:
+        return self._get("/v1/get-order")
+
+    def iter_image_reports(self) -> List[Dict[str, Any]]:
+        page = 1
+        items: List[Dict[str, Any]] = []
+        while True:
+            data = self._get(
+                "/v1/get-images-report",
+                params={"page": page, "pageSize": self.page_size},
+            )
+            chunk = data.get("result", {}).get("items") or []
+            if not chunk:
+                break
+            items.extend(chunk)
+            if len(chunk) < self.page_size:
+                break
+            page += 1
+        return items
+
+    def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        response = self.session.get(
+            f"{self.base_url}{path}",
+            headers=self._headers(),
+            params=params,
+            timeout=30,
+        )
+        response.raise_for_status()
+        data = response.json()
+        return data
+
+
+class CianReportWorker(threading.Thread):
+    def __init__(self, config: CheckConfig, objects_repo: ObjectsRepository):
+        super().__init__(daemon=True)
+        self.objects_repo = objects_repo
+        self.client = CianClient(config)
+        self.interval = max(config.cian_poll_interval, 60)
+
+    def run(self) -> None:
+        while True:
+            try:
+                self._run_once()
+            except Exception:  # pragma: no cover - background logging
+                LOG.exception("Cian report check failed")
+            time.sleep(self.interval)
+
+    def _run_once(self) -> None:
+        self.client.get_last_order_info()  # ensures endpoint reachable; result unused for now
+        report = self.client.get_order()
+        offers = (report.get("result") or {}).get("offers") or []
+        updated = 0
+        for offer in offers:
+            object_id = self._take_offer_id(offer)
+            status_value = offer.get("status")
+            normalized = self._normalize_status(status_value)
+            if object_id is None or normalized is None:
+                continue
+            try:
+                self.objects_repo.update_status(object_id, normalized)
+                updated += 1
+            except Exception:
+                LOG.exception("Failed to update object %s status from Cian report", object_id)
+        LOG.info("Cian report processed: %d objects updated", updated)
+
+    @staticmethod
+    def _normalize_status(value: Any) -> Optional[bool]:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return value
+        text = str(value).strip().lower()
+        if text in {"active", "ok", "true", "available"}:
+            return True
+        if text in {"inactive", "unpublished", "false", "error", "not_active"}:
+            return False
+        return None
+
+    @staticmethod
+    def _take_offer_id(offer: Dict[str, Any]) -> Optional[Any]:
+        for key in ("id", "objectId", "offerId"):
+            if key in offer:
+                return offer[key]
+        return None
 class TelegramNotifier:
     def __init__(self, config: CheckConfig):
         self.token = config.notify_bot_token
@@ -347,6 +491,7 @@ class OwnersCheckService:
         processed = 0
         while True:
             batch = self.owners_repo.fetch_unchecked(self.config.batch_size)
+            LOG.info("Fetched %d unchecked owners", len(batch))
             if not batch:
                 break
             for owner in batch:
@@ -382,6 +527,7 @@ class OwnersCheckService:
         url = (owner.get("url") or "").strip()
         if not owner_id:
             return False
+        LOG.info("Processing owner #%s", owner_id)
         if not url:
             LOG.warning("Owner #%s skipped: empty URL", owner_id)
             self._mark_checked(owner_id, {"parsed": "EMPTY_URL"})
@@ -391,6 +537,12 @@ class OwnersCheckService:
         try:
             self._apply_rate_limit(source)
             parser_result = self._call_parser(owner_id, url, source)
+            LOG.info(
+                "Parser result for owner #%s (%s): %s",
+                owner_id,
+                source,
+                self._stringify_result(parser_result)[:200],
+            )
         except HTTPError as exc:
             LOG.error("Parser HTTP error for owner #%s (%s): %s", owner_id, source, exc)
             return False
@@ -399,16 +551,20 @@ class OwnersCheckService:
             return False
 
         status_flag = self._extract_status(parser_result)
+        object_link = link_value if link_value not in (None, "") else owner_id
         inactive_reason = None
         if status_flag is False:
             inactive_reason = self._build_inactive_reason(parser_result)
-            self._delete_everywhere(owner_id, link_value, parser_result, inactive_reason)
+            self._delete_everywhere(owner, object_link, parser_result, inactive_reason)
             return True
+        if status_flag is True:
+            LOG.info("Owner #%s confirmed active", owner_id)
+        elif status_flag is None:
+            LOG.debug("Parser returned no status for owner #%s", owner_id)
 
-        self._handle_price(owner_id, link_value, parser_result)
+        self._handle_price(owner_id, object_link, parser_result)
         payload = {
             self.config.check_column: True,
-            "parsed": self._stringify_result(parser_result),
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
         if status_flag is not None:
@@ -458,15 +614,16 @@ class OwnersCheckService:
 
     def _delete_everywhere(
         self,
-        owner_id: int,
+        owner: Dict[str, Any],
         link_value: Optional[Any],
         parser_result: Optional[Any] = None,
         reason: Optional[str] = None,
     ) -> None:
+        owner_id = owner.get("id")
         row = self.objects_repo.fetch_by_link(link_value) if link_value else None
         external_value = row.get(self.objects_repo.link_column) if row else link_value
-        label = self._format_external_label(external_value)
-        summary_line = "❌ " + label + " — объявление больше не актуально"
+        label = self._format_object_label(owner_id, external_value)
+        summary_line = f"❌ {label} — объявление больше не актуально"
         LOG.info(summary_line)
         self._register_event(summary_line)
         try:
@@ -502,7 +659,11 @@ class OwnersCheckService:
         if not isinstance(parser_result, dict):
             return
         if not link_value:
-            LOG.debug("Owner #%s не содержит %s — пропуск обновления цены", owner_id, self.config.owners_link_column)
+            LOG.debug(
+                "Owner #%s не содержит значения для %s — пропуск обновления цены",
+                owner_id,
+                self.objects_repo.link_column,
+            )
             return
         raw_price = self._extract_price(parser_result)
         if raw_price is None:
@@ -510,6 +671,7 @@ class OwnersCheckService:
         new_price = self._normalize_price(raw_price)
         if new_price is None:
             return
+        LOG.debug("Parsed price for owner #%s: %s", owner_id, new_price)
         row = self.objects_repo.fetch_by_link(link_value)
         if not row:
             LOG.debug(
@@ -595,30 +757,16 @@ class OwnersCheckService:
         self.owners_repo.update_owner(owner_id, payload)
 
     def _owner_link(self, owner: Dict[str, Any]) -> Optional[Any]:
-        column = self.config.owners_link_column
-        if not column:
-            return owner.get("id")
+        column = self.config.owners_link_column or "id"
         value = owner.get(column)
-        if value in ("", None) and column != "id":
+        if value in (None, ""):
             return owner.get("id")
         return value
 
-    def _format_external_label(self, link_value: Optional[Any]) -> str:
-        column = self.objects_repo.link_column
-        if link_value in (None, ""):
-            return f"{column}=unknown"
-        return f"{column} {link_value}"
-
     @staticmethod
-    def _format_snippet(value: Any) -> str:
-        if value is None:
-            return "None"
-        if isinstance(value, (str, int, float, bool)):
-            return str(value)[:200]
-        try:
-            return json.dumps(value, ensure_ascii=False)[:200]
-        except (TypeError, ValueError):
-            return str(value)[:200]
+    def _format_object_label(owner_id: int, object_id: Optional[Any]) -> str:
+        value = object_id if object_id not in (None, "") else owner_id
+        return f"id {value}"
 
     @staticmethod
     def _build_inactive_reason(parser_result: Any) -> Optional[str]:
