@@ -5,7 +5,6 @@ import os
 import random
 import re
 import time
-import threading
 from dataclasses import dataclass
 from datetime import date, datetime, time as dt_time, timedelta, timezone
 from typing import Any, Dict, List, Optional
@@ -79,10 +78,6 @@ class CheckConfig:
     telegram_proxy_url: Optional[str]
     log_level: str
     summary_report_hour: int
-    cian_api_base: str
-    cian_api_token: Optional[str]
-    cian_poll_interval: int
-    cian_report_page_size: int
 
 
 def load_config() -> CheckConfig:
@@ -127,10 +122,6 @@ def load_config() -> CheckConfig:
         telegram_proxy_url=os.getenv("TELEGRAM_PROXY_URL") or None,
         log_level=os.getenv("OWNERS_CHECK_LOGLEVEL", "INFO").upper(),
         summary_report_hour=_env_int("SUMMARY_REPORT_HOUR", 10),
-        cian_api_base=os.getenv("CIAN_API_BASE", "https://public-api.cian.ru"),
-        cian_api_token=os.getenv("CIAN_API_TOKEN") or None,
-        cian_poll_interval=_env_int("CIAN_POLL_INTERVAL_SECONDS", 300),
-        cian_report_page_size=_env_int("CIAN_REPORT_PAGE_SIZE", 100),
     )
 
 
@@ -298,108 +289,6 @@ class ObjectsRepository:
             response.raise_for_status()
 
 
-class CianClient:
-    def __init__(self, config: CheckConfig):
-        if not config.cian_api_token:
-            raise RuntimeError("CIAN_API_TOKEN is required")
-        self.base_url = config.cian_api_base.rstrip("/")
-        self.token = config.cian_api_token
-        self.page_size = config.cian_report_page_size
-        self.session = requests.Session()
-
-    def _headers(self) -> Dict[str, str]:
-        return {
-            "Authorization": f"Bearer {self.token}",
-            "Accept": "application/json",
-        }
-
-    def get_last_order_info(self) -> Dict[str, Any]:
-        return self._get("/v1/get-last-order-info")
-
-    def get_order(self) -> Dict[str, Any]:
-        return self._get("/v1/get-order")
-
-    def iter_image_reports(self) -> List[Dict[str, Any]]:
-        page = 1
-        items: List[Dict[str, Any]] = []
-        while True:
-            data = self._get(
-                "/v1/get-images-report",
-                params={"page": page, "pageSize": self.page_size},
-            )
-            chunk = data.get("result", {}).get("items") or []
-            if not chunk:
-                break
-            items.extend(chunk)
-            if len(chunk) < self.page_size:
-                break
-            page += 1
-        return items
-
-    def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        response = self.session.get(
-            f"{self.base_url}{path}",
-            headers=self._headers(),
-            params=params,
-            timeout=30,
-        )
-        response.raise_for_status()
-        data = response.json()
-        return data
-
-
-class CianReportWorker(threading.Thread):
-    def __init__(self, config: CheckConfig, objects_repo: ObjectsRepository):
-        super().__init__(daemon=True)
-        self.objects_repo = objects_repo
-        self.client = CianClient(config)
-        self.interval = max(config.cian_poll_interval, 60)
-
-    def run(self) -> None:
-        while True:
-            try:
-                self._run_once()
-            except Exception:  # pragma: no cover - background logging
-                LOG.exception("Cian report check failed")
-            time.sleep(self.interval)
-
-    def _run_once(self) -> None:
-        self.client.get_last_order_info()  # ensures endpoint reachable; result unused for now
-        report = self.client.get_order()
-        offers = (report.get("result") or {}).get("offers") or []
-        updated = 0
-        for offer in offers:
-            object_id = self._take_offer_id(offer)
-            status_value = offer.get("status")
-            normalized = self._normalize_status(status_value)
-            if object_id is None or normalized is None:
-                continue
-            try:
-                self.objects_repo.update_status(object_id, normalized)
-                updated += 1
-            except Exception:
-                LOG.exception("Failed to update object %s status from Cian report", object_id)
-        LOG.info("Cian report processed: %d objects updated", updated)
-
-    @staticmethod
-    def _normalize_status(value: Any) -> Optional[bool]:
-        if value is None:
-            return None
-        if isinstance(value, bool):
-            return value
-        text = str(value).strip().lower()
-        if text in {"active", "ok", "true", "available"}:
-            return True
-        if text in {"inactive", "unpublished", "false", "error", "not_active"}:
-            return False
-        return None
-
-    @staticmethod
-    def _take_offer_id(offer: Dict[str, Any]) -> Optional[Any]:
-        for key in ("id", "objectId", "offerId"):
-            if key in offer:
-                return offer[key]
-        return None
 class TelegramNotifier:
     def __init__(self, config: CheckConfig):
         self.token = config.notify_bot_token
@@ -545,6 +434,9 @@ class OwnersCheckService:
             )
         except HTTPError as exc:
             LOG.error("Parser HTTP error for owner #%s (%s): %s", owner_id, source, exc)
+            self._register_event(
+                f"⚠️ {source} error for id {owner_id}: обновите куки/авторизацию"
+            )
             return False
         except requests.RequestException as exc:
             LOG.error("Parser network error for owner #%s: %s", owner_id, exc)
