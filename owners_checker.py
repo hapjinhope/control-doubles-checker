@@ -618,11 +618,11 @@ class OwnersCheckService:
         return None
 
     @staticmethod
-    def _normalize_price(value: Any) -> Optional[float]:
+    def _normalize_price(value: Any) -> Optional[int]:
         if value is None or isinstance(value, bool):
             return None
         if isinstance(value, (int, float)):
-            return float(value)
+            return int(round(float(value)))
         if isinstance(value, str):
             cleaned = value.replace("\xa0", "").replace(" ", "")
             cleaned = re.sub(r"[^\d.,-]", "", cleaned)
@@ -630,7 +630,7 @@ class OwnersCheckService:
                 return None
             cleaned = cleaned.replace(",", ".")
             try:
-                return float(cleaned)
+                return int(round(float(cleaned)))
             except ValueError:
                 return None
         return None
