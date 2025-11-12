@@ -210,7 +210,9 @@ class ObjectsRepository:
         self.link_column = config.objects_link_column or "id"
 
     def _make_params(self, link_value: Any) -> Dict[str, Any]:
-        columns = [self.config.objects_price_column]
+        columns = []
+        if self.config.objects_price_column:
+            columns.append(self.config.objects_price_column)
         if self.link_column not in columns:
             columns.append(self.link_column)
         return {
@@ -516,13 +518,13 @@ class OwnersCheckService:
         external_value = row.get(self.objects_repo.link_column) if row else link_value
         label = self._format_object_label(owner_id, external_value)
         summary_line = f"❌ {label} — объявление больше не актуально"
-        LOG.info(summary_line)
+        LOG.info("Owner %s deletion: %s", owner_id, summary_line)
         self._register_event(summary_line)
         try:
             self.owners_repo.delete_owner(owner_id)
-            LOG.info("Owner %s удалён", label)
+            LOG.info("Owner %s удалён", owner_id)
         except Exception:
-            LOG.exception("Failed to delete owner %s", label)
+            LOG.exception("Failed to delete owner %s", owner_id)
         if external_value in (None, ""):
             LOG.warning(
                 "%s отсутствует для %s, пропускаем удаление в objects",
@@ -533,11 +535,10 @@ class OwnersCheckService:
             try:
                 self.objects_repo.delete_object(external_value)
                 LOG.info(
-                    "Object %s удалён из %s по %s=%s",
-                    label,
-                    self.config.objects_table,
-                    self.objects_repo.link_column,
+                    "Object owners_id %s deleted from %s (external_id %s)",
                     external_value,
+                    self.config.objects_table,
+                    row.get("external_id"),
                 )
             except Exception:
                 LOG.exception(
@@ -658,7 +659,7 @@ class OwnersCheckService:
     @staticmethod
     def _format_object_label(owner_id: int, object_id: Optional[Any]) -> str:
         value = object_id if object_id not in (None, "") else owner_id
-        return f"id {value}"
+        return f"owners_id {value}"
 
     @staticmethod
     def _build_inactive_reason(parser_result: Any) -> Optional[str]:
