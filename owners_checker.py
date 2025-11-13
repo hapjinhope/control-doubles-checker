@@ -78,6 +78,7 @@ class CheckConfig:
     telegram_proxy_url: Optional[str]
     log_level: str
     summary_report_hour: int
+    summary_timezone_offset: int
 
 
 def load_config() -> CheckConfig:
@@ -100,6 +101,7 @@ def load_config() -> CheckConfig:
     owners_link_column = os.getenv("OWNERS_LINK_COLUMN") or "id"
     objects_link_column = os.getenv("OBJECTS_LINK_COLUMN") or owners_link_column
 
+    tz_offset = _env_int("SUMMARY_TZ_OFFSET", 0)
     return CheckConfig(
         supabase_url=supabase_url,
         supabase_key=supabase_key,
@@ -122,6 +124,7 @@ def load_config() -> CheckConfig:
         telegram_proxy_url=os.getenv("TELEGRAM_PROXY_URL") or None,
         log_level=os.getenv("OWNERS_CHECK_LOGLEVEL", "INFO").upper(),
         summary_report_hour=_env_int("SUMMARY_REPORT_HOUR", 10),
+        summary_timezone_offset=tz_offset,
     )
 
 
@@ -352,6 +355,10 @@ class OwnersCheckService:
         self.daily_events: List[str] = []
         self.events_date: date = datetime.now().date()
         self.last_summary_date: Optional[date] = None
+        self.daily_processed = 0
+        self.stats_removed: List[int] = []
+        self.stats_price_down: List[tuple[int, Optional[int], Optional[int]]] = []
+        self.stats_price_up: List[tuple[int, Optional[int], Optional[int]]] = []
 
     def run_forever(self) -> None:
         LOG.info(
@@ -387,6 +394,7 @@ class OwnersCheckService:
                 break
             for owner in batch:
                 processed += int(self._process_owner(owner))
+        self.daily_processed += processed
         return processed
 
     def _maybe_reset(self, now: datetime) -> None:
@@ -515,17 +523,19 @@ class OwnersCheckService:
     ) -> None:
         owner_id = owner.get("id")
         row = self.objects_repo.fetch_by_link(link_value) if link_value else None
-        external_value = row.get(self.objects_repo.link_column) if row else link_value
-        label = self._format_object_label(owner_id, external_value)
+        owners_link_value = row.get(self.objects_repo.link_column) if row else link_value
+        label = self._format_object_label(owner_id, owners_link_value)
         summary_line = f"❌ {label} — объявление больше не актуально"
         LOG.info("Owner %s deletion: %s", owner_id, summary_line)
         self._register_event(summary_line)
+        if isinstance(owner_id, int):
+            self.stats_removed.append(owner_id)
         try:
             self.owners_repo.delete_owner(owner_id)
             LOG.info("Owner %s удалён", owner_id)
         except Exception:
             LOG.exception("Failed to delete owner %s", owner_id)
-        if external_value in (None, ""):
+        if owners_link_value in (None, ""):
             LOG.warning(
                 "%s отсутствует для %s, пропускаем удаление в objects",
                 self.objects_repo.link_column,
@@ -533,19 +543,18 @@ class OwnersCheckService:
             )
         else:
             try:
-                self.objects_repo.delete_object(external_value)
+                self.objects_repo.delete_object(owners_link_value)
+                external_id_for_log = row.get("external_id") if isinstance(row, dict) else None
                 LOG.info(
                     "Object owners_id %s deleted from %s (external_id %s)",
-                    external_value,
+                    owners_link_value,
                     self.config.objects_table,
-                    row.get("external_id"),
+                    external_id_for_log,
                 )
             except Exception:
                 LOG.exception(
-                    "Failed to delete object %s by %s %s",
-                    label,
-                    self.objects_repo.link_column,
-                    external_value,
+                    "Failed to delete object owners_id %s",
+                    owners_link_value,
                 )
 
     def _handle_price(self, owner_id: int, link_value: Optional[Any], parser_result: Any) -> None:
@@ -587,6 +596,7 @@ class OwnersCheckService:
                     self._register_event(
                         f"📉 {label} — цена изменилась {self._fmt_price(current_price)} → {self._fmt_price(new_price)}"
                     )
+                    self.stats_price_down.append((owner_id, current_price, new_price))
             except Exception:
                 LOG.exception("Failed to update price for %s", label)
         elif new_price > current_price:
@@ -594,6 +604,7 @@ class OwnersCheckService:
             self._register_event(
                 f"📈 {label} — цена изменилась {self._fmt_price(current_price)} → {self._fmt_price(new_price)}"
             )
+            self.stats_price_up.append((owner_id, current_price, new_price))
 
     @staticmethod
     def _extract_status(data: Any) -> Optional[bool]:
@@ -685,24 +696,51 @@ class OwnersCheckService:
     def _register_event(self, line: str) -> None:
         today = datetime.now().date()
         if today != self.events_date:
-            self.daily_events = []
-            self.events_date = today
-            self.last_summary_date = None
+            self._reset_daily_state(today)
         self.daily_events.append(line)
 
+    @staticmethod
+    def _format_price_report(title: str, entries: List[tuple[int, Optional[int], Optional[int]]]) -> str:
+        if not entries:
+            return f"{title}: 0"
+        parts = []
+        for owner_id, old, new in entries:
+            if old is None or new is None:
+                parts.append(f"{owner_id}")
+            else:
+                parts.append(f"{owner_id} ({old}→{new})")
+        return f"{title}: {len(entries)} ({', '.join(parts)})"
+
     def _maybe_send_summary(self, now: datetime) -> None:
-        if now.hour < self.config.summary_report_hour:
+        target_hour = (self.config.summary_report_hour - self.config.summary_timezone_offset) % 24
+        if now.hour < target_hour:
             return
         if self.last_summary_date == now.date():
             return
-        if not self.daily_events:
+        if not self.daily_events and self.daily_processed == 0:
             self.last_summary_date = now.date()
             return
         LOG.info("Sending daily summary (%d events)", len(self.daily_events))
-        self.notifier.send_summary(now.date(), self.daily_events)
+        summary_lines = [
+            f"Проверено объектов: {self.daily_processed}",
+            f"Удалено: {len(self.stats_removed)} ({', '.join(map(str, self.stats_removed)) or '—'})",
+            self._format_price_report("Снижение", self.stats_price_down),
+            self._format_price_report("Повышение", self.stats_price_up),
+        ]
+        payload = summary_lines + self.daily_events
+        self.notifier.send_summary(now.date(), payload)
         self.last_summary_date = now.date()
-        self.daily_events = []
+        self._reset_daily_state(now.date(), reset_summary=False)
 
+    def _reset_daily_state(self, today: date, reset_summary: bool = True) -> None:
+        self.daily_events = []
+        self.events_date = today
+        if reset_summary:
+            self.last_summary_date = None
+        self.daily_processed = 0
+        self.stats_removed = []
+        self.stats_price_down = []
+        self.stats_price_up = []
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Nightly owners checker")
