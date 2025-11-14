@@ -1,1 +1,2 @@
-worker: python owners_checker.py
+checker: python owners_checker.py
+duplicates: python duplicates_checker.py
